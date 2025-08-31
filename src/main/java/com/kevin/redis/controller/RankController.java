@@ -11,20 +11,22 @@ import java.util.List;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/rank")
 @RequiredArgsConstructor
+@RequestMapping("/rank")
 public class RankController {
 
     private final RankService rankService;
 
     @PostMapping("/add")
-    public ResponseEntity<?> add(@RequestBody AddScoreRequest req) {
-        double newScore = rankService.addScore(req.getMember(), req.getDelta());
-        return ResponseEntity.ok(Map.of("member", req.getMember(), "score", newScore));
+    public Map<String,Object> add(@RequestBody Map<String,Object> req) {
+        String member = (String) req.get("member");
+        double delta = ((Number) req.get("delta")).doubleValue();
+        double newScore = rankService.addScore(member, delta, (String) req.getOrDefault("reason","manual"));
+        return Map.of("member", member, "newScore", newScore);
     }
 
-    @GetMapping("/top10")
-    public ResponseEntity<List<Rank>> top10() {
-        return ResponseEntity.ok(rankService.topN(10));
+    @GetMapping("/top{n}")
+    public List<Rank> top(@PathVariable int n) {
+        return rankService.topN(n);
     }
 }

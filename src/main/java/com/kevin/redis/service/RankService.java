@@ -1,6 +1,13 @@
 package com.kevin.redis.service;
 
 import com.kevin.redis.dto.Rank;
+import com.kevin.redis.persistence.model.ScoreEvent;
+import com.kevin.redis.persistence.model.User;
+import com.kevin.redis.persistence.repository.ScoreEventRepository;
+import com.kevin.redis.persistence.repository.UserRepository;
+import com.kevin.redis.persistence.repository.UserScoreRepository;
+import jakarta.annotation.Nullable;
+import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,85 +23,56 @@ import java.util.*;
 public class RankService {
 
     private final StringRedisTemplate redis;
+    private final UserRepository userRepo;
+    private final ScoreEventRepository eventRepo;
+    private final UserScoreRepository userScoreRepo;
 
-    /**
-     * 排行榜 ZSET 的 key；可由 application.properties 透過 app.rank.key 覆蓋，預設值為 "rank:global"。
-     */
     @Value("${app.rank.key:rank:global}")
     private String rankKey;
 
-    /**
-     * 增加成員分數；若成員不存在則建立並賦初值。
-     * <p>底層對應 Redis：ZINCRBY。</p>
-     *
-     * @param member
-     *         成員（例如 username 或 userId）
-     * @param delta
-     *         要增加的分數（可正可負；不可為 NaN）
-     *
-     * @return 增分後的最新分數（若底層回傳 null，則回 0）
-     */
-    public double addScore(String member, double delta) {
-        if (Double.isNaN(delta)) {
-            log.warn("增分失敗，delta 不能為 NaN，member={}", member);
-            throw new IllegalArgumentException("delta 不能為 NaN");
-        }
-
-        long start = System.nanoTime();
-        log.info("更新排行榜分數開始, key={}, member={}, delta={}", rankKey, member, delta);
-        Double newScore = redis.opsForZSet().incrementScore(rankKey, member, delta);
-        double result = newScore == null ? 0d : newScore;
-        long costMs = (System.nanoTime() - start) / 1_000_000;
-
-        log.info("更新排行榜分數完成, member={}, newScore={}, cost={}ms", member, result, costMs);
-        log.debug("ZINCRBY 明細: key={}, member={}, delta={}, newScore={}", rankKey, member, delta, result);
-        return result;
+    private static void ensureFinite(double v) {
+        if (!Double.isFinite(v)) throw new IllegalArgumentException("delta 不能為 NaN/Infinity");
     }
 
-    /**
-     * 取得前 N 名（分數由高到低），並回傳 member 與 score 清單。
-     * <p>底層對應 Redis：ZRANGE key 0 (n-1) REV WITHSCORES（6.2+ 的建議語法；
-     * Spring 封裝方法為 {@code reverseRangeWithScores}）。</p>
-     *
-     * @param n 要取的名次數量（n <= 0 時回空清單）
-     * @return 每筆 Map 內容：
-     * <ul>
-     *   <li>member：成員（字串）</li>
-     *   <li>score：分數（Double）</li>
-     * </ul>
-     */
+    @Transactional
+    public double addScore(String username, double delta, @Nullable String reason) {
+        ensureFinite(delta);
+        User user = userRepo.findByUsername(username)
+                            .orElseThrow(() -> new IllegalArgumentException("找不到使用者：" + username));
+
+        long t0 = System.nanoTime();
+        // 1) 寫 DB：事件 + 快照
+        eventRepo.save(new ScoreEvent(user.getId(), delta, reason));
+        userScoreRepo.upsertAndAdd(user.getId(), delta);
+        Double dbScore = userScoreRepo.findScore(user.getId());
+        double latest = dbScore == null ? 0d : dbScore;
+
+        // 2) 寫 Redis（即時榜）
+        try {
+            redis.opsForZSet().incrementScore(rankKey, username, delta);
+        } catch (Exception e) {
+            // 不讓 DB 交易回滾（避免遺失真相），但打警告並交給對帳機制補救
+            log.warn("ZINCRBY 失敗，稍後需對帳。user={}, delta={}, err={}", username, delta, e.toString());
+        }
+
+        log.info("addScore ok user={}, delta={}, newScore={}", username, delta, latest);
+        log.debug("cost={}ms", (System.nanoTime()-t0)/1_000_000);
+        return latest;
+    }
+
+    /** 取 Redis TopN（高→低） */
     public List<Rank> topN(int n) {
-        if (n <= 0) {
-            log.warn("查詢 TopN 參數異常，n 必須 > 0，收到 n={}", n);
-            return List.of();
+        if (n <= 0) return List.of();
+        var tuples = redis.opsForZSet().reverseRangeWithScores(rankKey, 0, n - 1);
+        if (tuples == null || tuples.isEmpty()) return List.of();
+
+        List<Rank> list = new ArrayList<>(tuples.size());
+        for (ZSetOperations.TypedTuple<String> t : tuples) {
+            String member = t.getValue();
+            Double score  = t.getScore();
+            if (member == null || score == null || !Double.isFinite(score)) continue;
+            list.add(new Rank(member, score));
         }
-
-        long start = System.nanoTime();
-        log.info("查詢排行榜 TopN 開始, key={}, n={}", rankKey, n);
-
-        /**
-         * 0, n-1 代表取出 前 n 筆（因為是 index，從 0 開始）
-         * reverseRangeWithScores = 由大到小取出，並且帶上 score（分數）
-         */
-        Set<ZSetOperations.TypedTuple<String>> set = redis.opsForZSet().reverseRangeWithScores(rankKey, 0, n - 1);
-        List<Rank> list = new ArrayList<>();
-        if (set == null || set.isEmpty()) {
-            log.info("查無排行資料或 ZSET 尚未建立, key={}", rankKey);
-            return list;
-        }
-
-        for (ZSetOperations.TypedTuple<String> t : set) {
-            Rank rank = Rank.builder()
-                            .member(t.getValue())   // ZSET 的 member
-                            .score(t.getScore())    // ZSET 的 score (Double)
-                            .build();
-
-            list.add(rank);
-        }
-
-        long costMs = (System.nanoTime() - start) / 1_000_000;
-        log.info("查詢排行榜 TopN 完成, key={}, n={}, 回傳筆數={}, cost={}ms", rankKey, n, list.size(), costMs);
-        log.debug("TopN 明細: {}", list);
         return list;
     }
 }
